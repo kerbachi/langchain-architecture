@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-docgen.py - template-driven multi-agent document generator built on LangGraph.
+docgen.py - outline-driven multi-agent document generator built on LangGraph.
 
 Three inputs, kept separate so the same engine serves any similar request:
-  --template  reusable    : document purpose, sections (agents), their questions, sources, checks
+  --template  reusable    : document title, OUTLINE (exact section titles in order), each section's
+                            directives and sources, consistency checks
   --request   per request : global context (Markdown) + YAML front-matter variables
   --config    per env     : LLM endpoints (any OpenAI-compatible /v1 API), output folder
+
+The script prints every heading itself, from the template. The agents only write section bodies.
 
   python docgen.py -t templates/component_standard.yaml -r requests/s3_files_aegon_spain.md
   python docgen.py -t ... -r ... --dry-run   # no LLM / network calls: tests the orchestration
@@ -56,22 +59,24 @@ class SourceSpec(BaseModel):
 
 
 class SectionSpec(BaseModel):
-    id: str                                # machine id, used for node names and dependencies
-    name: str                              # display name, e.g. "Drivers & motivation"
-    questions: str                         # free text; one question per non-empty line
+    id: str                                # machine id: node names, depends_on, file names
+    title: str                             # printed in the document exactly as written
+    directives: str | list[str]            # one item per line (or a YAML list); each item is checked
     sources: list[SourceSpec] = []         # extra sources of truth on top of the request context
-    use_request_context: bool = True       # global context [R1] given to this agent
-    depends_on: list[str] = []             # empty = runs in parallel from the start
+    use_request_context: bool = True       # give the global context [R1] to this agent
+    depends_on: list[str] = []             # empty = starts immediately, in parallel with the others
     guidelines: str = ""                   # section-specific writing guidance
 
     @property
-    def question_list(self) -> list[tuple[str, str]]:
-        lines = [ln.strip() for ln in self.questions.splitlines() if ln.strip()]
-        return [(f"{self.id}:q{i}", q) for i, q in enumerate(lines, 1)]
+    def directive_list(self) -> list[tuple[str, str]]:
+        items = self.directives if isinstance(self.directives, list) else self.directives.splitlines()
+        items = [str(x).strip() for x in items if str(x).strip()]
+        return [(f"{self.id}:d{i}", text) for i, text in enumerate(items, 1)]
 
 
 class Template(BaseModel):
     document_title: str
+    numbering: bool = True
     purpose: str
     required_vars: list[str] = []
     defaults: dict[str, Any] = {}
@@ -79,7 +84,17 @@ class Template(BaseModel):
     key_facts: list[str] = []
     source_precedence: list[str] = ["request", "file", "m365", "url", "web"]
     max_revision_rounds: int = 1
-    sections: list[SectionSpec]
+    sections: list[SectionSpec]            # the OUTLINE: list order = document order
+
+    def heading(self, spec: SectionSpec) -> str:
+        n = [s.id for s in self.sections].index(spec.id) + 1
+        return f"{n}. {spec.title}" if self.numbering else spec.title
+
+    def section(self, sid: str) -> SectionSpec:
+        return next(s for s in self.sections if s.id == sid)
+
+    def outline(self) -> str:
+        return "\n".join(self.heading(s) for s in self.sections)
 
 
 class LLMRole(BaseModel):
@@ -88,7 +103,11 @@ class LLMRole(BaseModel):
     api_key_env: Optional[str] = None
     temperature: float = 0.2
     max_concurrency: int = 4
-    json_mode: bool = False                # true only if the endpoint supports response_format=json_object
+    # false: plain text + tolerant JSON parsing (works everywhere)
+    # true: response_format=json_object | "schema": response_format=json_schema (LM Studio, vLLM, OpenAI)
+    json_mode: bool | Literal["schema"] = False
+    max_tokens: Optional[int] = None       # cap output length (avoids truncated JSON on small defaults)
+    extra_body: dict[str, Any] = {}        # server-specific options, e.g. vLLM chat_template_kwargs
     timeout_s: float = 300
 
 
@@ -156,7 +175,8 @@ def load_inputs(template_path: str, request_path: str, config_path: Optional[str
     return tpl, variables, context, cfg
 
 
-def topo_order(tpl: Template) -> list[str]:
+def execution_order(tpl: Template) -> list[list[str]]:
+    """Validates dependencies and returns the execution waves (agents in a wave run in parallel)."""
     ids = [s.id for s in tpl.sections]
     if len(ids) != len(set(ids)):
         raise SystemExit("section ids must be unique")
@@ -164,17 +184,17 @@ def topo_order(tpl: Template) -> list[str]:
     for sid, d in deps.items():
         if unknown := d - set(ids):
             raise SystemExit(f"section '{sid}' depends on unknown section(s) {sorted(unknown)}")
-    order: list[str] = []
+    waves: list[list[str]] = []
     while deps:
         ready = [k for k, v in deps.items() if not v]
         if not ready:
             raise SystemExit(f"dependency cycle among sections {sorted(deps)}")
-        order += ready
+        waves.append(ready)
         for k in ready:
             deps.pop(k)
         for v in deps.values():
             v.difference_update(ready)
-    return order
+    return waves
 
 
 # =============================================================================
@@ -186,12 +206,12 @@ class Claim(BaseModel):
 
 
 class SectionDraft(BaseModel):
-    markdown: str
+    body: str
     claims: list[Claim] = []
     key_facts: dict[str, str] = {}
     assumptions: list[str] = []
     open_questions: list[str] = []
-    questions_answered: list[str] = []
+    directives_covered: list[str] = []
 
     @field_validator("key_facts", mode="before")
     @classmethod
@@ -234,6 +254,20 @@ def extract_json(text: str) -> dict:
     return json.loads(text[start:end + 1], strict=False)  # tolerate raw newlines inside strings
 
 
+def inline_schema(model_cls: type[BaseModel]) -> dict:
+    """Pydantic JSON schema with $refs inlined (grammar-based engines handle flat schemas best)."""
+    schema = model_cls.model_json_schema()
+    defs = schema.pop("$defs", {})
+
+    def resolve(node):
+        if isinstance(node, dict):
+            if "$ref" in node:
+                return resolve(defs[node["$ref"].split("/")[-1]])
+            return {k: resolve(v) for k, v in node.items()}
+        return [resolve(x) for x in node] if isinstance(node, list) else node
+    return resolve(schema)
+
+
 class LLM:
     def __init__(self, role: LLMRole, name: str):
         from openai import AsyncOpenAI
@@ -244,7 +278,16 @@ class LLM:
 
     async def json(self, system: str, user: str, model_cls: type[BaseModel]) -> BaseModel:
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        extra = {"response_format": {"type": "json_object"}} if self.role.json_mode else {}
+        extra: dict[str, Any] = {}
+        if self.role.json_mode == "schema":
+            extra["response_format"] = {"type": "json_schema", "json_schema": {
+                "name": model_cls.__name__, "schema": inline_schema(model_cls)}}
+        elif self.role.json_mode is True:
+            extra["response_format"] = {"type": "json_object"}
+        if self.role.max_tokens:
+            extra["max_tokens"] = self.role.max_tokens
+        if self.role.extra_body:
+            extra["extra_body"] = self.role.extra_body
         last: Exception | None = None
         for _ in range(3):
             async with self.sem:
@@ -259,6 +302,19 @@ class LLM:
                              {"role": "user", "content": f"Invalid JSON for the required schema: {str(e)[:400]}. "
                                                          "Reply with the corrected JSON object only."}]
         raise RuntimeError(f"{self.name}: no valid JSON after 3 attempts: {last}")
+
+    async def preflight(self) -> None:
+        """Warn early if the endpoint is unreachable or does not serve the configured model id."""
+        try:
+            ids = [m.id async for m in self.client.models.list()]
+        except Exception as e:
+            log(f"WARNING {self.name}: cannot list models at {self.role.base_url} ({err_text(e)})")
+            return
+        if ids and self.role.model not in ids:
+            log(f"WARNING {self.name}: model '{self.role.model}' not served at {self.role.base_url}; "
+                f"available: {ids[:10]}{' ...' if len(ids) > 10 else ''}")
+        else:
+            log(f"{self.name}: {self.role.model} @ {self.role.base_url} OK")
 
 
 # =============================================================================
@@ -396,31 +452,34 @@ async def gather_evidence(spec: SectionSpec, context: dict, http, loaders, max_c
 # =============================================================================
 # 5. PROMPTS (generic; all request-specific text comes from the template and request files)
 # =============================================================================
-WRITER_SYSTEM = """You are an enterprise architect writing ONE section of an architecture document.
-Ground every statement in the REQUEST CONTEXT [R1] or the EVIDENCE [E1], [E2] ... and cite them inline.
-Upstream sections are context for consistency, not evidence.
-Never invent figures, costs, dates, product capabilities or decisions. If something the questions need is
+WRITER_SYSTEM = """You are an enterprise architect writing the BODY of ONE section of an architecture document.
+The document template already provides every heading, so do not write any headings (no lines starting with #).
+Write well-structured paragraphs; use bullet lists only where they make the content clearer.
+Ground every statement in the REQUEST CONTEXT [R1] or the EVIDENCE [E1], [E2] ... and cite them inline like [R1].
+Other sections of the OUTLINE are written by other agents: cover only your own directives, not their content.
+Upstream sections, when given, are for consistency only.
+Never invent figures, costs, dates, product capabilities or decisions. If something your directives need is
 missing from the sources, say so in the text and add it to open_questions.
 Return ONLY a JSON object with this shape:
-{"markdown": "the section body in Markdown, one '### ' heading per question, with [R1]/[E1] citations",
- "claims": [{"statement": "a key claim made in the text", "evidence": ["R1", "E1"]}],
+{"body": "the section body in Markdown, no headings, with [R1]/[E1] citations",
+ "claims": [{"statement": "a key claim made in the body", "evidence": ["R1", "E1"]}],
  "key_facts": {"<key fact name>": "<short canonical value>"},
  "assumptions": ["..."],
  "open_questions": ["..."],
- "questions_answered": ["<question id>"]}"""
+ "directives_covered": ["<directive id>"]}"""
 
-REVIEWER_SYSTEM = """You are the final reviewer of an architecture document whose sections were written in parallel
-by separate agents. Check every section against the REQUEST CONTEXT and the document PURPOSE:
+REVIEWER_SYSTEM = """You are the final reviewer of an architecture document whose sections were written by separate
+agents, following a fixed OUTLINE. Check every section against the REQUEST CONTEXT and the document PURPOSE:
 1. Contradictions between sections (component identity, what it replaces, platforms, alternatives, constraints,
    dates, numbers, terminology).
-2. Questions not answered, or answered weakly.
+2. Directives not covered, or covered weakly.
 3. Statements that conflict with the request's requirements, constraints or requested outcome, or drift out of scope.
 4. Claims, figures or capabilities not supported by the cited sources.
-5. Heavy duplication between sections (each section should own its own questions).
+5. Content placed in the wrong section, or heavily duplicated across sections.
 Automated checks are listed in <findings>: confirm or dismiss them and add what they missed. When sections
 disagree, prefer the value supported by the sources, then the section whose sources rank higher in SOURCE
 PRECEDENCE. Request revisions only for sections that must change, with concrete instructions. Use verdict
-"pass" only when no revision is needed.
+"pass" only when no revision is needed. Refer to sections by their id.
 Return ONLY a JSON object:
 {"verdict": "pass" | "revise",
  "conflicts": [{"sections": ["id_a", "id_b"], "description": "...", "severity": "high|medium|low",
@@ -434,14 +493,15 @@ def writer_prompt(tpl: Template, spec: SectionSpec, evidence: list[dict], upstre
                   revision: str | None = None, previous: str | None = None) -> str:
     ctx = next((e for e in evidence if e["id"] == "R1"), None)
     ev = "\n\n".join(f"[{e['id']}] ({e['source']}: {e['locator']})\n{e['text']}" for e in evidence if e["id"] != "R1")
-    up = "\n\n".join(f"### {sid}\n{d['markdown'][:6000]}\nKey facts: {json.dumps(d['key_facts'])}"
-                     for sid, d in upstream.items())
-    qs = "\n".join(f"{qid}: {q}" for qid, q in spec.question_list)
-    parts = [f"DOCUMENT: {tpl.document_title}", f"PURPOSE: {tpl.purpose}"]
+    up = "\n\n".join(f"--- {tpl.heading(tpl.section(sid))} ---\n{d['body'][:6000]}\nKey facts: "
+                     f"{json.dumps(d['key_facts'])}" for sid, d in upstream.items())
+    directives = "\n".join(f"{did}: {text}" for did, text in spec.directive_list)
+    parts = [f"DOCUMENT: {tpl.document_title}", f"PURPOSE: {tpl.purpose}",
+             "OUTLINE (each section is written by a different agent):\n" + tpl.outline()]
     if ctx:
         parts.append(f'<request_context id="R1">\n{ctx["text"]}\n</request_context>')
-    parts += [f"SECTION: {spec.name} (id: {spec.id})",
-              "Answer each question under its own '### ' heading, in this order:\n" + qs,
+    parts += [f"YOUR SECTION: {tpl.heading(spec)} (id: {spec.id})",
+              "DIRECTIVES (cover all of them, in this order):\n" + directives,
               "WRITING GUIDELINES:\n" + "\n".join(x for x in (tpl.writer_guidelines, spec.guidelines) if x.strip()),
               f"KEY FACTS to report (only those this section takes a position on): {', '.join(tpl.key_facts) or '(none)'}",
               "UPSTREAM SECTIONS (context only):\n" + (up or "(none)"),
@@ -452,26 +512,26 @@ def writer_prompt(tpl: Template, spec: SectionSpec, evidence: list[dict], upstre
     return "\n\n".join(parts)
 
 
-def reviewer_prompt(tpl: Template, context: dict, sections: dict, evidence: dict, findings: list, by_id: dict) -> str:
-    parts = [f"DOCUMENT: {tpl.document_title}", f"PURPOSE: {tpl.purpose}",
+def reviewer_prompt(tpl: Template, context: dict, sections: dict, evidence: dict, findings: list) -> str:
+    parts = [f"DOCUMENT: {tpl.document_title}", f"PURPOSE: {tpl.purpose}", "OUTLINE:\n" + tpl.outline(),
              f'<request_context id="R1">\n{context["text"][:20000]}\n</request_context>',
              f"SOURCE PRECEDENCE (highest first): {' > '.join(tpl.source_precedence)}",
              f"<findings>\n{json.dumps(findings, indent=1)}\n</findings>"]
-    for sid, d in sections.items():
-        s = by_id[sid]
-        srcs = ", ".join(f"{e['id']}={e['source']}:{e['locator']}" for e in evidence.get(sid, []))
-        qs = "\n".join(f"{qid}: {q}" for qid, q in s.question_list)
+    for s in tpl.sections:  # in document order
+        d = sections[s.id]
+        srcs = ", ".join(f"{e['id']}={e['source']}:{e['locator']}" for e in evidence.get(s.id, []))
+        directives = "\n".join(f"{did}: {text}" for did, text in s.directive_list)
         claims = "\n".join(f"- {c['statement']} {c['evidence']}" for c in d["claims"][:40])
-        parts.append(f"""<section id="{sid}" name="{s.name}">
+        parts.append(f"""<section id="{s.id}" heading="{tpl.heading(s)}">
 Sources: {srcs or 'none'}
-Questions:
-{qs}
+Directives:
+{directives}
 Key facts: {json.dumps(d['key_facts'])}
 Claims:
 {claims or '(none)'}
 Open questions: {d['open_questions']}
 Body:
-{d['markdown'][:6000]}
+{d['body'][:6000]}
 </section>""")
     return "\n\n".join(parts)
 
@@ -491,7 +551,7 @@ FIGURE = re.compile(r"(?:[$€£]\s?\d[\d.,]*\s?[kKmM]?\b|\b\d+(?:[.,]\d+)?\s?(?
                     r"hours?\b|days?\b|weeks?\b|months?\b|years?\b|[KMGTP]i?B\b|USD\b|EUR\b|x\b))")
 
 
-def deterministic_checks(tpl: Template, sections: dict, evidence: dict, by_id: dict) -> list[dict]:
+def deterministic_checks(tpl: Template, sections: dict, evidence: dict) -> list[dict]:
     findings: list[dict] = []
     rank = {t: i for i, t in enumerate(tpl.source_precedence)}
     order = {s.id: i for i, s in enumerate(tpl.sections)}
@@ -519,31 +579,36 @@ def deterministic_checks(tpl: Template, sections: dict, evidence: dict, by_id: d
                          "preferred_value": best[0][1],
                          "preferred_because": "found in sources, then source precedence, then majority"})
 
-    for sid, d in sections.items():
-        # (b) questions the agent did not answer
-        missing = [qid for qid, _ in by_id[sid].question_list if qid not in d["questions_answered"]]
+    for s in tpl.sections:
+        d = sections[s.id]
+        # (b) directives the agent did not cover
+        missing = [did for did, _ in s.directive_list if did not in d["directives_covered"]]
         if missing:
-            findings.append({"type": "unanswered_questions", "section": sid, "questions": missing})
+            findings.append({"type": "directives_not_covered", "section": s.id, "directives": missing})
         # (c) claims citing nothing, or citing sources that do not exist
-        valid = {e["id"] for e in evidence.get(sid, [])}
+        valid = {e["id"] for e in evidence.get(s.id, [])}
         bad = [c["statement"][:140] for c in d["claims"] if not c["evidence"] or not set(c["evidence"]) <= valid]
         if bad:
-            findings.append({"type": "unsupported_claims", "section": sid, "count": len(bad), "examples": bad[:5]})
+            findings.append({"type": "unsupported_claims", "section": s.id, "count": len(bad), "examples": bad[:5]})
         # (d) figures (%, money, durations, sizes) that appear in no source
-        compact_src = re.sub(r"\s+", "", src_text.get(sid, "")).lower()
-        figs = sorted({f.strip() for f in FIGURE.findall(d["markdown"])
+        compact_src = re.sub(r"\s+", "", src_text.get(s.id, "")).lower()
+        figs = sorted({f.strip() for f in FIGURE.findall(d["body"])
                        if re.sub(r"\s+", "", f).lower() not in compact_src})
         if figs:
-            findings.append({"type": "ungrounded_figures", "section": sid, "figures": figs[:10]})
+            findings.append({"type": "ungrounded_figures", "section": s.id, "figures": figs[:10]})
     return findings
+
+
+HEADING_LINE = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", flags=re.M)
 
 
 def clean_draft(draft: SectionDraft, tpl: Template, spec: SectionSpec) -> dict:
     d = draft.model_dump()
+    d["body"] = HEADING_LINE.sub(r"**\1**", d["body"]).strip()  # headings belong to the template only
     if tpl.key_facts:
         d["key_facts"] = {k: v for k, v in d["key_facts"].items() if k in tpl.key_facts}
-    valid_q = {qid for qid, _ in spec.question_list}
-    d["questions_answered"] = [q for q in d["questions_answered"] if q in valid_q]
+    valid = {did for did, _ in spec.directive_list}
+    d["directives_covered"] = [x for x in d["directives_covered"] if x in valid]
     return d
 
 
@@ -552,9 +617,9 @@ def err_text(e: Exception) -> str:
 
 
 def failed_draft(spec: SectionSpec, e: Exception) -> dict:
-    return {"markdown": f"> **Section generation failed:** `{err_text(e)}`", "claims": [], "key_facts": {},
-            "assumptions": [], "open_questions": [f"'{spec.name}' could not be generated: {err_text(e)}"],
-            "questions_answered": []}
+    return {"body": f"> **Section generation failed:** `{err_text(e)}`", "claims": [], "key_facts": {},
+            "assumptions": [], "open_questions": [f"'{spec.title}' could not be generated: {err_text(e)}"],
+            "directives_covered": []}
 
 
 # =============================================================================
@@ -565,10 +630,11 @@ def merge(a: dict, b: dict) -> dict:
 
 
 class State(TypedDict, total=False):
-    sections: Annotated[dict, merge]       # reducer: parallel nodes each add their own key
+    sections: Annotated[dict, merge]       # reducer: parallel agents each add their own key
     evidence: Annotated[dict, merge]
     errors: Annotated[dict, merge]
     history: Annotated[list, operator.add]
+    refreshed: Annotated[list, operator.add]
     findings: list
     review: dict
     round: int
@@ -580,7 +646,7 @@ def build_graph(tpl: Template, context: dict, writer, reviewer, http, loaders, m
 
     def section_agent(spec: SectionSpec):
         async def run(state: State):
-            log(f"start  {spec.name}")
+            log(f"start  {tpl.heading(spec)}")
             upstream = {d: state["sections"][d] for d in spec.depends_on}
             try:
                 evidence = await gather_evidence(spec, context, http, loaders, max_chars)
@@ -588,16 +654,16 @@ def build_graph(tpl: Template, context: dict, writer, reviewer, http, loaders, m
                 result, err = clean_draft(draft, tpl, spec), {}
             except Exception as e:  # one failing source must not sink the run
                 evidence, result, err = [], failed_draft(spec, e), {spec.id: err_text(e)}
-            log(f"done   {spec.name}  sources={[e['id'] for e in evidence]} key_facts={result['key_facts']}")
+            log(f"done   {tpl.heading(spec)}  sources={[e['id'] for e in evidence]}")
             return {"sections": {spec.id: result}, "evidence": {spec.id: evidence}, "errors": err}
         return run
 
     async def reconcile(state: State):
         rnd = state.get("round", 0) + 1
-        findings = deterministic_checks(tpl, state["sections"], state["evidence"], by_id)
+        findings = deterministic_checks(tpl, state["sections"], state["evidence"])
         log(f"review round {rnd}: {len(findings)} automated finding(s)")
         try:
-            prompt = reviewer_prompt(tpl, context, state["sections"], state["evidence"], findings, by_id)
+            prompt = reviewer_prompt(tpl, context, state["sections"], state["evidence"], findings)
             review = (await reviewer.json(REVIEWER_SYSTEM, prompt, Review)).model_dump()
         except Exception as e:
             review = {"verdict": "error", "conflicts": [], "gaps": [], "overlaps": [], "revisions": [],
@@ -617,19 +683,58 @@ def build_graph(tpl: Template, context: dict, writer, reviewer, http, loaders, m
         return "finalize"
 
     async def revise_section(payload: dict):
-        sid = payload["section_id"]
-        spec = by_id[sid]
-        log(f"revise {spec.name}")
+        spec = by_id[payload["section_id"]]
+        log(f"revise {tpl.heading(spec)}")
         upstream = {d: payload["sections"][d] for d in spec.depends_on}
-        prompt = writer_prompt(tpl, spec, payload["evidence"].get(sid, []), upstream,
-                               revision=payload["instructions"], previous=payload["sections"][sid]["markdown"])
+        prompt = writer_prompt(tpl, spec, payload["evidence"].get(spec.id, []), upstream,
+                               revision=payload["instructions"], previous=payload["sections"][spec.id]["body"])
         try:  # same cached evidence: same sources of truth, reproducible
-            return {"sections": {sid: clean_draft(await writer.json(WRITER_SYSTEM, prompt, SectionDraft), tpl, spec)}}
+            draft = await writer.json(WRITER_SYSTEM, prompt, SectionDraft)
+            return {"sections": {spec.id: clean_draft(draft, tpl, spec)}}
         except Exception as e:
-            return {"errors": {sid: f"revision failed: {err_text(e)}"}}
+            return {"errors": {spec.id: f"revision failed: {err_text(e)}"}}
+
+    dependents = {s.id: [t.id for t in tpl.sections if s.id in t.depends_on] for s in tpl.sections}
+
+    def downstream(ids: set[str]) -> set[str]:
+        seen: set[str] = set()
+        stack = list(ids)
+        while stack:
+            for nxt in dependents[stack.pop()]:
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        return seen
+
+    async def refresh_dependents(state: State):
+        """A revised section can make the sections built on it stale (e.g. a summary written last):
+        re-run those dependents, wave by wave, so the next review sees a consistent document."""
+        revised = {r["section_id"] for r in state["review"]["revisions"]}
+        stale = downstream(revised) - revised
+        if not stale:
+            return {}
+        sections, updates = dict(state["sections"]), {}
+
+        async def rerun(spec: SectionSpec):
+            log(f"refresh {tpl.heading(spec)} (upstream revised)")
+            prompt = writer_prompt(tpl, spec, state["evidence"].get(spec.id, []),
+                                   {d: sections[d] for d in spec.depends_on},
+                                   revision="Upstream sections were revised. Update this section so it stays "
+                                            "consistent with them.", previous=sections[spec.id]["body"])
+            try:
+                return clean_draft(await writer.json(WRITER_SYSTEM, prompt, SectionDraft), tpl, spec)
+            except Exception as e:
+                log(f"refresh failed for {spec.id}: {err_text(e)}")
+                return None
+        for wave in execution_order(tpl):
+            todo = [sid for sid in wave if sid in stale]
+            for sid, d in zip(todo, await asyncio.gather(*(rerun(by_id[x]) for x in todo))):
+                if d:
+                    sections[sid] = updates[sid] = d
+        return {"sections": updates, "refreshed": sorted(updates)}
 
     async def finalize(state: State):
-        write_outputs(tpl, state, by_id, out_dir)
+        write_outputs(tpl, state, out_dir)
         return {}
 
     g = StateGraph(State)
@@ -637,39 +742,56 @@ def build_graph(tpl: Template, context: dict, writer, reviewer, http, loaders, m
         g.add_node(node(s.id), section_agent(s))
     for s in tpl.sections:
         if not s.depends_on:
-            g.add_edge(START, node(s.id))                              # fan-out: all start together
+            g.add_edge(START, node(s.id))                              # fan-out: starts immediately
         elif len(s.depends_on) == 1:
             g.add_edge(node(s.depends_on[0]), node(s.id))              # sequence
         else:
             g.add_edge([node(d) for d in s.depends_on], node(s.id))    # join: waits for all
     g.add_node("reconcile", reconcile)
     g.add_node("revise_section", revise_section)
+    g.add_node("refresh_dependents", refresh_dependents)
     g.add_node("finalize", finalize)
     all_sections = [node(s.id) for s in tpl.sections]
     g.add_edge(all_sections if len(all_sections) > 1 else all_sections[0], "reconcile")  # fan-in
     g.add_conditional_edges("reconcile", route, ["revise_section", "finalize"])
-    g.add_edge("revise_section", "reconcile")
+    g.add_edge("revise_section", "refresh_dependents")
+    g.add_edge("refresh_dependents", "reconcile")
     g.add_edge("finalize", END)
     return g.compile()
 
 
 # =============================================================================
-# 8. OUTPUTS
+# 8. OUTPUTS - headings come from the template, in template order
 # =============================================================================
+CITATION = re.compile(r"\s?\[(?:R|E)\d+(?:\s*[,;]\s*(?:R|E)\d+)*\]")
+
+
 def _cell(s: Any) -> str:
     return str(s).replace("|", "\\|").replace("\n", " ")
 
 
-def render_report(tpl: Template, state: State, by_id: dict) -> str:
+def render_document(tpl: Template, state: State, annotated: bool) -> str:
+    lines = [f"# {tpl.document_title}", ""]
+    for s in tpl.sections:                                   # template order, never execution order
+        body = state["sections"][s.id]["body"]
+        lines += [f"## {tpl.heading(s)}", "", body if annotated else CITATION.sub("", body), ""]
+        if annotated:
+            lines += ["*Sources:*", ""] + [f"- [{e['id']}] {e['source']}: {e['locator']} (sha256 {e['sha256']})"
+                                          for e in state["evidence"].get(s.id, [])] + [""]
+    return "\n".join(lines)
+
+
+def render_report(tpl: Template, state: State) -> str:
     rv = state.get("review", {})
+    by_id = {s.id: s for s in tpl.sections}
     status = {"pass": "PASS", "revise": "UNRESOLVED - human decision needed (revision rounds exhausted)"} \
         .get(rv.get("verdict"), "REVIEWER ERROR - human review needed")
     L = [f"# Reconciliation report - {tpl.document_title}", "", f"**Status:** {status}  ",
          f"**Review rounds:** {state.get('round', 0)}", "", rv.get("summary", ""), "", "## Conflicts", ""]
     if rv.get("conflicts"):
         L += ["| Severity | Sections | Description | Recommended resolution |", "|---|---|---|---|"]
-        L += [f"| {c['severity']} | {', '.join(c['sections'])} | {_cell(c['description'])} | "
-              f"{_cell(c['recommended_resolution'])} |" for c in rv["conflicts"]]
+        L += [f"| {c['severity']} | {', '.join(tpl.heading(by_id[x]) if x in by_id else x for x in c['sections'])} | "
+              f"{_cell(c['description'])} | {_cell(c['recommended_resolution'])} |" for c in rv["conflicts"]]
     else:
         L.append("None remaining.")
     L += ["", "## Gaps against the request", ""] + ([f"- {g}" for g in rv.get("gaps", [])] or ["None."])
@@ -678,52 +800,47 @@ def render_report(tpl: Template, state: State, by_id: dict) -> str:
           "```", "", "## Revision history", ""]
     L += [f"- Round {h['round']}: {h['verdict']}, {h['conflicts']} conflict(s); revised: {', '.join(h['revised']) or '-'}"
           for h in state.get("history", [])]
-    oq = [(by_id[sid].name, q) for sid, d in state["sections"].items() for q in d["open_questions"]]
-    L += ["", "## Open questions", ""] + ([f"- **{n}:** {q}" for n, q in oq] or ["None."])
+    if state.get("refreshed"):
+        L.append(f"- Dependent sections refreshed after revisions: {', '.join(state['refreshed'])}")
+    oq = [(tpl.heading(s), q) for s in tpl.sections for q in state["sections"][s.id]["open_questions"]]
+    L += ["", "## Open questions", ""] + ([f"- **{h}:** {q}" for h, q in oq] or ["None."])
     if state.get("errors"):
         L += ["", "## Errors", ""] + [f"- **{k}:** {v}" for k, v in state["errors"].items()]
     return "\n".join(L) + "\n"
 
 
-def write_outputs(tpl: Template, state: State, by_id: dict, out: Path) -> None:
-    (out / "sections").mkdir(parents=True, exist_ok=True)
-    doc = [f"# {tpl.document_title}", ""]
-    for sid in topo_order(tpl):
-        spec, d = by_id[sid], state["sections"][sid]
-        srcs = "\n".join(f"- [{e['id']}] {e['source']}: {e['locator']} (sha256 {e['sha256']})"
-                         for e in state["evidence"].get(sid, [])) or "- none"
-        body = f"## {spec.name}\n\n{d['markdown']}\n\n**Sources**\n\n{srcs}\n"
-        (out / "sections" / f"{sid}.md").write_text(body, encoding="utf-8")
-        doc.append(body)
-    (out / "document.md").write_text("\n".join(doc), encoding="utf-8")
-    (out / "reconciliation_report.md").write_text(render_report(tpl, state, by_id), encoding="utf-8")
-    keep = ("sections", "evidence", "errors", "findings", "review", "history")
+def write_outputs(tpl: Template, state: State, out: Path) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "document.md").write_text(render_document(tpl, state, annotated=False), encoding="utf-8")
+    (out / "document_annotated.md").write_text(render_document(tpl, state, annotated=True), encoding="utf-8")
+    (out / "reconciliation_report.md").write_text(render_report(tpl, state), encoding="utf-8")
+    keep = ("sections", "evidence", "errors", "findings", "review", "history", "refreshed")
     (out / "run.json").write_text(json.dumps({k: state.get(k) for k in keep}, indent=2), encoding="utf-8")
-    log(f"wrote {out}/document.md, reconciliation_report.md, run.json")
+    log(f"wrote {out}/document.md, document_annotated.md, reconciliation_report.md, run.json")
 
 
 # =============================================================================
 # 9. DRY RUN (offline stand-ins for the LLMs and sources)
 # =============================================================================
 class FakeLLM:
-    """Plants a wrong key fact and an invented figure in the second section, so the dry run shows
-    the automated checks, the reviewer, and the targeted revision loop at work."""
+    """Plants a wrong key fact, an invented figure and a stray heading in one section, so the dry run
+    shows heading clean-up, the automated checks, the reviewer and the targeted revision loop."""
 
-    def __init__(self, first_section_id: str):
-        self.first_id = first_section_id
+    def __init__(self, planted_section_id: str):
+        self.planted = planted_section_id
 
     async def json(self, system: str, user: str, model_cls):
         await asyncio.sleep(0.5)
         if model_cls is SectionDraft:
             sid = re.search(r"\(id: ([\w-]+)\)", user).group(1)
-            qids = re.findall(r"^(\S+:q\d+): ", user, flags=re.M)
-            first = sid == self.first_id
-            revising = "REVISION REQUEST" in user
+            dids = re.findall(r"^(\S+:d\d+): ", user, flags=re.M)
+            wrong = sid == self.planted and "REVISION REQUEST" not in user
+            body = "\n\n".join(f"Dry-run paragraph for {d} [R1]." for d in dids)
+            if wrong:
+                body = "### A heading the model should not write\n\n" + body + "\n\nIt cuts operating cost by 40%."
             facts = {"component_name": "Amazon S3 Files",
-                     "target_platform": "Amazon Linux 2023" if first or revising else "Amazon Linux 2"}
-            extra = "" if first or revising else "\n\nIt cuts operating cost by 40%."
-            body = "\n\n".join(f"### {q}\nDry-run answer [R1]." for q in qids) + extra
-            return SectionDraft(markdown=body, key_facts=facts, questions_answered=qids,
+                     "target_platform": "Amazon Linux 2" if wrong else "Amazon Linux 2023"}
+            return SectionDraft(body=body, key_facts=facts, directives_covered=dids,
                                 claims=[Claim(statement=f"{sid} claim", evidence=["R1"])])
         findings = json.loads(re.search(r"<findings>\n(.*?)\n</findings>", user, flags=re.S).group(1))
         revs: dict[str, str] = {}
@@ -753,7 +870,7 @@ async def fake_loader(src: SourceSpec, http) -> list[dict]:
 # =============================================================================
 async def amain() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("-t", "--template", required=True, help="reusable template YAML")
+    ap.add_argument("-t", "--template", required=True, help="reusable template YAML (outline + directives)")
     ap.add_argument("-r", "--request", required=True, help="request Markdown (global context + front matter)")
     ap.add_argument("-c", "--config", default="config.yaml", help="environment config YAML")
     ap.add_argument("-o", "--out", help="output folder (default: <output_dir>/<request file name>)")
@@ -762,27 +879,30 @@ async def amain() -> None:
     args = ap.parse_args()
 
     tpl, variables, context_text, cfg = load_inputs(args.template, args.request, args.config)
-    order = topo_order(tpl)
+    waves = execution_order(tpl)
     context = _ev("request", args.request, context_text)
     out_dir = Path(args.out or Path(cfg.output_dir) / Path(args.request).stem)
-    log(f"'{tpl.document_title}': {len(tpl.sections)} agents, order {' -> '.join(order)}")
+    log(f"document: {tpl.document_title}")
+    log("outline:  " + " | ".join(tpl.heading(s) for s in tpl.sections))
+    log("run order: " + " -> ".join("[" + ", ".join(w) + "]" for w in waves))
 
-    async with httpx.AsyncClient(timeout=60, headers={"User-Agent": "docgen/0.2"}) as http:
+    async with httpx.AsyncClient(timeout=60, headers={"User-Agent": "docgen/0.4"}) as http:
         if args.dry_run or args.graph:
-            writer = reviewer = FakeLLM(tpl.sections[0].id)
+            writer = reviewer = FakeLLM(tpl.sections[-1].id)
             loaders = {k: fake_loader for k in LOADERS}
         else:
             if not {"writer", "reviewer"} <= set(cfg.llm):
                 raise SystemExit(f"{args.config} must define llm.writer and llm.reviewer")
             writer, reviewer = LLM(cfg.llm["writer"], "writer"), LLM(cfg.llm["reviewer"], "reviewer")
             loaders = LOADERS
+            await asyncio.gather(writer.preflight(), reviewer.preflight())
             if any(src.type == "m365" for s in tpl.sections for src in s.sources):
                 GRAPH_TOKEN["token"] = await asyncio.to_thread(acquire_graph_token)  # one SSO prompt per run
         graph = build_graph(tpl, context, writer, reviewer, http, loaders, cfg.max_evidence_chars, out_dir)
         if args.graph:
             print(graph.get_graph().draw_mermaid())
             return
-        await graph.ainvoke({"sections": {}, "evidence": {}, "errors": {}, "history": [], "round": 0},
+        await graph.ainvoke({"sections": {}, "evidence": {}, "errors": {}, "history": [], "refreshed": [], "round": 0},
                             {"recursion_limit": 100})
 
 

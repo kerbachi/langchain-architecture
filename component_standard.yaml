@@ -1,18 +1,17 @@
 # =============================================================================
 # REUSABLE TEMPLATE - "Component standard request"
-# Nothing here is specific to one request. Request-specific values come from the
-# request file's front matter through {{variables}}.
+# Request-specific values come from the request file front matter via {{variables}}.
 # =============================================================================
 
 document_title: "Component standard request: {{component}}"
+numbering: true        # prints "1. Component Summary", "2. Purpose" ... (false = titles exactly as written)
 
 purpose: >
-  Produce the sections of a component-standard justification that the Enterprise Technology (ET)
-  architecture review will assess. The document must support the decision and outcome requested
-  in the request context, and stay consistent with its requirements and constraints.
+  Produce a component-standard request that the Enterprise Technology (ET) architecture review will
+  assess. The document must support the decision and outcome requested in the request context and
+  stay consistent with its requirements and constraints.
 
 required_vars: [component]          # the request file MUST define these
-
 defaults:                           # used when the request file does not define them
   reference_urls: []
   attachments: []
@@ -21,10 +20,9 @@ writer_guidelines: |
   - Audience: enterprise architecture review board. Factual and concise, no marketing language.
   - Use the request context [R1] as the primary source of truth; use [E..] evidence for product facts.
   - Do not invent figures, costs, dates or capabilities. State explicitly what is unknown.
-  - 120 to 300 words per question.
+  - About 150 to 400 words per section unless the section guidelines say otherwise.
 
-# Facts every agent reports in a structured way; disagreements are flagged automatically.
-key_facts:
+key_facts:                          # reported by every agent; disagreements are flagged automatically
   - component_name
   - replaces
   - target_platform
@@ -34,19 +32,40 @@ key_facts:
 source_precedence: [request, file, m365, url, web]   # highest authority first
 max_revision_rounds: 1
 
-# -----------------------------------------------------------------------------
-# AGENTS - one per section. No depends_on = they run in parallel.
-# -----------------------------------------------------------------------------
+# =============================================================================
+# DOCUMENT OUTLINE - the order below IS the order of the final document.
+#   title       printed exactly as written (numbered automatically if numbering: true)
+#   directives  what the agent must cover; one item per line, each one checked in the final review
+#   sources     extra sources of truth; the request text [R1] is always included
+#   depends_on  changes WHEN an agent runs, never WHERE its section appears
+# =============================================================================
 sections:
 
+  - id: component_summary
+    title: "Component Summary"
+    directives: |
+      Summarize what the component is and which current solution it replaces.
+      State the decision requested from ET.
+    depends_on: [purpose, drivers_motivation, business_value]   # runs last, printed first
+    guidelines: |
+      - One paragraph, at most 150 words.
+      - Summarize what the other sections establish; do not introduce new facts.
+
+  - id: purpose
+    title: "Purpose"
+    directives: |
+      Describe the business problem this request addresses.
+      State the outcome and deliverables requested from ET.
+      Identify the impacted business unit and the key constraints (platform, deadlines, budget).
+
   - id: drivers_motivation
-    name: "Drivers & motivation"
-    questions: |
+    title: "Overview: Drivers and Motivation"
+    directives: |
       Describe what the component is.
       Describe the motivation for using the component.
       Explain what distinguishes the component from others that were evaluated or are in use within the enterprise.
     sources:
-      - type: url                   # vendor documentation supplied by the request
+      - type: url                   # vendor documentation listed in the request front matter
         urls: "{{reference_urls}}"
       - type: file                  # optional attachments (PDF, DOCX, MD ...)
         paths: "{{attachments}}"
@@ -56,24 +75,14 @@ sections:
       #   filter_expression: 'path:"https://yourtenant.sharepoint.com/sites/ArchitectureStandards/"'
 
   - id: business_value
-    name: "Business Value"
-    questions: |
+    title: "Business Value"
+    directives: |
       Describe the business value for the component.
-
       Why should this component be introduced as a component standard within the organization?
-
       What value is gained by having the component approved for use within the enterprise?
     sources:
       - type: file
         paths: "{{attachments}}"
     guidelines: |
       - Tie each value statement to a business need, constraint or success criterion in the request context.
-      - Do not repeat the product description; that belongs to "Drivers & motivation".
-
-  # Example of a THIRD agent that runs after both of the above (sequential):
-  # - id: risks_controls
-  #   name: "Risks & controls"
-  #   questions: |
-  #     What risks does adopting the component introduce?
-  #     Which security, logging and operational controls are required?
-  #   depends_on: [drivers_motivation, business_value]
+      - Do not repeat the product description; it belongs to "Overview: Drivers and Motivation".

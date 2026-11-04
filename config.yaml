@@ -3,12 +3,15 @@ output_dir: out                  # results go to out/<request file name>/
 max_evidence_chars: 24000        # per agent, extra sources only (the request context is always sent)
 
 llm:
-  writer:                                   # the section agents
-    base_url: "http://192.168.2.13:1234/v1" #"http://localhost:11434/v1"   # Ollama. vLLM: http://localhost:8000/v1
-    model: "qwen3:32b"
-    max_concurrency: 2                      # how many agents may call the model at once
-  reviewer:                                 # the final reconciliation step
+  writer:                                     # the section agents
+    base_url: "http://192.168.2.13:1234/v1"   # LM Studio on your network (server must serve on the local network)
+    model: "qwen3:32b"                        # MUST match an id from: curl http://192.168.2.13:1234/v1/models
+    json_mode: schema                         # LM Studio enforces the JSON schema; use false if a model rejects it
+    max_tokens: 8192                          # long sections + JSON; avoids truncated output
+    timeout_s: 600                            # local 32B models can be slow on long sections
+    max_concurrency: 2                        # how many agents may call the model at once
+  reviewer:                                   # the final reconciliation step
     base_url: "https://openrouter.ai/api/v1"
-    model: "openai/gpt-4o"                  # ideally a stronger model from a different family
+    model: "openai/gpt-4o"                    # ideally a stronger model from a different family
     api_key_env: OPENROUTER_API_KEY
     temperature: 0.0
