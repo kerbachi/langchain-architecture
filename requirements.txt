@@ -1,0 +1,11 @@
+# Core (all open source). Lock exact versions with hashes before production use, e.g.:
+#   pip-compile --generate-hashes requirements.txt -o requirements.lock
+langgraph>=1.0,<2
+openai>=1.40          # used only as an OpenAI-compatible client: vLLM, Ollama, OpenRouter, OpenAI...
+httpx>=0.27
+pydantic>=2.7
+PyYAML>=6.0
+
+# Optional
+# azure-identity>=1.17   # m365 source: delegated SSO via device code
+# docling>=2.0           # file source: PDF / DOCX / PPTX parsing

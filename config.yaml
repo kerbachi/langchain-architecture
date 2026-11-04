@@ -1,0 +1,14 @@
+# Environment settings. Secrets stay in environment variables, never in this file.
+output_dir: out                  # results go to out/<request file name>/
+max_evidence_chars: 24000        # per agent, extra sources only (the request context is always sent)
+
+llm:
+  writer:                                   # the section agents
+    base_url: "http://localhost:11434/v1"   # Ollama. vLLM: http://localhost:8000/v1
+    model: "qwen3:32b"
+    max_concurrency: 2                      # how many agents may call the model at once
+  reviewer:                                 # the final reconciliation step
+    base_url: "https://openrouter.ai/api/v1"
+    model: "openai/gpt-4o"                  # ideally a stronger model from a different family
+    api_key_env: OPENROUTER_API_KEY
+    temperature: 0.0
