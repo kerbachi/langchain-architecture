@@ -4,7 +4,7 @@ max_evidence_chars: 24000        # per agent, extra sources only (the request co
 
 llm:
   writer:                                   # the section agents
-    base_url: "http://localhost:11434/v1"   # Ollama. vLLM: http://localhost:8000/v1
+    base_url: "http://192.168.2.13:1234/v1" #"http://localhost:11434/v1"   # Ollama. vLLM: http://localhost:8000/v1
     model: "qwen3:32b"
     max_concurrency: 2                      # how many agents may call the model at once
   reviewer:                                 # the final reconciliation step
