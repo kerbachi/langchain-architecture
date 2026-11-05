@@ -6,6 +6,8 @@ httpx>=0.27
 pydantic>=2.7
 PyYAML>=6.0
 
+pytest
+
 # Optional
 # azure-identity>=1.17   # m365 source: delegated SSO via device code
 # docling>=2.0           # file source: PDF / DOCX / PPTX parsing
