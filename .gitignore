@@ -2,6 +2,7 @@
 out/*
 requests
 templates
+docs_cache
 __pycache__/
 .venv/
 .pytest_cache/
