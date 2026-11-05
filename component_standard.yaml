@@ -30,7 +30,7 @@ key_facts:                          # reported by every agent; disagreements are
   - alternatives_evaluated
   - deciding_requirement
 
-source_precedence: [request, file, m365, url, web]   # highest authority first
+source_precedence: [request, file, docs, m365, url, web]   # highest authority first
 max_revision_rounds: 1
 
 # =============================================================================
@@ -40,6 +40,11 @@ max_revision_rounds: 1
 #   sources     extra sources of truth; the request text [R1] is always included
 #   depends_on  changes WHEN an agent runs, never WHERE its section appears
 #   table_columns  makes the section a table with exactly these columns (drawn by the script)
+#   retrieval_keywords  extra words used to pick the relevant passages from the official docs
+#
+# Official documentation (type: docs): only the listed URLs are fetched. With recursive: true, linked
+# pages under the same address are collected too (e.g. .../s3-files.html -> .../s3-files-quotas.html).
+# Each agent then receives only the passages relevant to its section. See README "Official documentation".
 # =============================================================================
 sections:
 
@@ -67,10 +72,12 @@ sections:
       Describe the motivation for using the component.
       Explain what distinguishes the component from others that were evaluated or are in use within the enterprise.
     sources:
-      - type: url                   # vendor documentation listed in the request front matter
+      - type: docs                  # official documentation: URLs from the requirements file
         urls: "{{reference_urls}}"
+        recursive: true             # also collect linked pages under the same address
       - type: file                  # optional attachments (PDF, DOCX, MD ...)
         paths: "{{attachments}}"
+    retrieval_keywords: "overview introduction features how it works architecture protocol compared"
       # Enterprise catalogue, to compare with components already in use (needs M365 Copilot licence):
       # - type: m365
       #   query: "Which file storage and S3 access components are approved standards?"
@@ -85,6 +92,9 @@ sections:
     table_columns: ["Title", "Description"]
     depends_on: [drivers_motivation]        # receives the finished "Overview: Drivers and Motivation" section
     sources:
+      - type: docs
+        urls: "{{reference_urls}}"
+        recursive: true
       - type: file
         paths: "{{policy_documents}}"       # corporate policy and governance documents, if provided
       # Policy and governance pages from SharePoint (needs M365 Copilot licence):
@@ -95,6 +105,7 @@ sections:
       - Short phrases only. Title: 2 to 6 words. Description: one sentence, at most 20 words.
       - 3 to 8 rows, most important first. Accepted use cases only, no rejected or future ones.
       - No implementation details; those belong to other sections.
+    retrieval_keywords: "use cases workloads supported unsupported limits quotas performance"
 
   - id: business_value
     title: "Business Value"
@@ -103,8 +114,12 @@ sections:
       Why should this component be introduced as a component standard within the organization?
       What value is gained by having the component approved for use within the enterprise?
     sources:
+      - type: docs
+        urls: "{{reference_urls}}"
+        recursive: true
       - type: file
         paths: "{{attachments}}"
+    retrieval_keywords: "pricing cost performance scalability durability availability operations management"
     guidelines: |
       - Tie each value statement to a business need, constraint or success criterion in the request context.
       - Do not repeat the product description; it belongs to "Overview: Drivers and Motivation".

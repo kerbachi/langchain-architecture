@@ -5,3 +5,4 @@ templates
 __pycache__/
 .venv/
 .pytest_cache/
+docs_cache/index-*.sqlite

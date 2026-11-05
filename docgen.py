@@ -37,6 +37,8 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 from pydantic import BaseModel, ValidationError, field_validator
 
+from docs_library import Collection, DocsLibrary, DocsSettings, query_terms
+
 T0 = time.time()
 
 
@@ -48,9 +50,12 @@ def log(msg: str) -> None:
 # 1. INPUTS: template (reusable), request (global context + variables), config (environment)
 # =============================================================================
 class SourceSpec(BaseModel):
-    type: Literal["file", "url", "web", "m365"]
+    type: Literal["docs", "file", "url", "web", "m365"]
     paths: list[str] = []                  # file
-    urls: list[str] = []                   # url
+    urls: list[str] = []                   # docs, url
+    recursive: bool = False                # docs: true = also collect linked pages under the same prefix
+    under: list[str] = []                  # docs: explicit prefixes for recursive (default: derived from url)
+    max_pages: Optional[int] = None        # docs: page limit per url when recursive (default: config docs.max_pages)
     query: Optional[str] = None            # web, m365 (m365: one sentence, <= 1,500 chars)
     allow_domains: list[str] = []          # web
     max_results: int = 5                   # web, m365 (m365 max 25)
@@ -67,6 +72,7 @@ class SectionSpec(BaseModel):
     depends_on: list[str] = []             # empty = starts immediately, in parallel with the others
     guidelines: str = ""                   # section-specific writing guidance
     table_columns: list[str] = []          # set = the section is a table with exactly these columns
+    retrieval_keywords: str = ""           # docs: extra search words for picking relevant passages
 
     @property
     def directive_list(self) -> list[tuple[str, str]]:
@@ -83,7 +89,7 @@ class Template(BaseModel):
     defaults: dict[str, Any] = {}
     writer_guidelines: str = ""
     key_facts: list[str] = []
-    source_precedence: list[str] = ["request", "file", "m365", "url", "web"]
+    source_precedence: list[str] = ["request", "file", "docs", "m365", "url", "web"]
     max_revision_rounds: int = 1
     sections: list[SectionSpec]            # the OUTLINE: list order = document order
 
@@ -116,6 +122,7 @@ class Config(BaseModel):
     llm: dict[str, LLMRole] = {}
     output_dir: str = "out"
     max_evidence_chars: int = 24000
+    docs: DocsSettings = DocsSettings()
 
 
 VAR = re.compile(r"\{\{\s*([A-Za-z_]\w*)\s*\}\}")
@@ -446,10 +453,23 @@ async def load_m365(src: SourceSpec, http) -> list[dict]:
 LOADERS = {"file": load_file, "url": load_url, "web": load_web, "m365": load_m365}
 
 
-async def gather_evidence(spec: SectionSpec, context: dict, http, loaders, max_chars: int) -> list[dict]:
+def docs_collections(tpl: Template, settings: DocsSettings) -> dict[str, list[Collection]]:
+    """Section id -> the documentation collections its docs sources define."""
+    return {s.id: [Collection(url=u, recursive=src.recursive, under=src.under,
+                              max_pages=src.max_pages or settings.max_pages)
+                   for src in s.sources if src.type == "docs" for u in src.urls]
+            for s in tpl.sections}
+
+
+async def gather_evidence(spec: SectionSpec, context: dict, http, loaders, max_chars: int,
+                          docs=None, docs_keys: list[str] | None = None) -> list[dict]:
     items: list[dict] = []
     for src in spec.sources:
-        items += await loaders[src.type](src, http)
+        if src.type != "docs":
+            items += await loaders[src.type](src, http)
+    if docs and docs_keys:  # local search in the collected snapshot: no network
+        terms = query_terms(spec.retrieval_keywords, spec.title, *(t for _, t in spec.directive_list))
+        items += docs.retrieve(docs_keys, terms)
     budget = max_chars // max(len(items), 1)
     for i, it in enumerate(items, 1):
         it["id"] = f"E{i}"
@@ -661,12 +681,14 @@ class State(TypedDict, total=False):
     errors: Annotated[dict, merge]
     history: Annotated[list, operator.add]
     refreshed: Annotated[list, operator.add]
+    docs_summary: list
     findings: list
     review: dict
     round: int
 
 
-def build_graph(tpl: Template, context: dict, writer, reviewer, http, loaders, max_chars: int, out_dir: Path):
+def build_graph(tpl: Template, context: dict, writer, reviewer, http, loaders, max_chars: int, out_dir: Path,
+                docs=None, docs_keys: dict[str, list[str]] | None = None, refresh_docs: bool = False):
     by_id = {s.id: s for s in tpl.sections}
     node = lambda sid: f"sec_{sid}"  # noqa: E731
 
@@ -675,7 +697,8 @@ def build_graph(tpl: Template, context: dict, writer, reviewer, http, loaders, m
             log(f"start  {tpl.heading(spec)}")
             upstream = {d: state["sections"][d] for d in spec.depends_on}
             try:
-                evidence = await gather_evidence(spec, context, http, loaders, max_chars)
+                evidence = await gather_evidence(spec, context, http, loaders, max_chars,
+                                                 docs, (docs_keys or {}).get(spec.id))
                 draft = await writer.json(WRITER_SYSTEM, writer_prompt(tpl, spec, evidence, upstream), SectionDraft)
                 result, err = clean_draft(draft, tpl, spec), {}
             except Exception as e:  # one failing source must not sink the run
@@ -764,12 +787,23 @@ def build_graph(tpl: Template, context: dict, writer, reviewer, http, loaders, m
         write_outputs(tpl, state, out_dir)
         return {}
 
+    async def collect_docs(state: State):
+        try:
+            return {"docs_summary": await docs.collect(refresh=refresh_docs)}
+        except Exception as e:  # agents still run, with the requirements and their other sources
+            return {"docs_summary": [], "errors": {"official docs": err_text(e)}}
+
     g = StateGraph(State)
+    first = START
+    if docs:
+        g.add_node("collect_docs", collect_docs)                      # runs once, before every agent
+        g.add_edge(START, "collect_docs")
+        first = "collect_docs"
     for s in tpl.sections:
         g.add_node(node(s.id), section_agent(s))
     for s in tpl.sections:
         if not s.depends_on:
-            g.add_edge(START, node(s.id))                              # fan-out: starts immediately
+            g.add_edge(first, node(s.id))                              # fan-out: starts immediately
         elif len(s.depends_on) == 1:
             g.add_edge(node(s.depends_on[0]), node(s.id))              # sequence
         else:
@@ -846,6 +880,11 @@ def render_report(tpl: Template, state: State) -> str:
         L.append(f"- Dependent sections refreshed after revisions: {', '.join(state['refreshed'])}")
     oq = [(tpl.heading(s), q) for s in tpl.sections for q in state["sections"][s.id]["open_questions"]]
     L += ["", "## Open questions", ""] + ([f"- **{h}:** {q}" for h, q in oq] or ["None."])
+    if state.get("docs_summary"):
+        L += ["", "## Official documentation used", "",
+              "| Start URL | Recursive | Pages | Skipped | Collected | Snapshot folder |", "|---|---|---|---|---|---|"]
+        L += [f"| {d['url']} | {'yes' if d['recursive'] else 'no'} | {d['pages']} | {d['skipped']} | "
+              f"{d['collected_at'][:10]} | {d['folder']} |" for d in state["docs_summary"]]
     if state.get("errors"):
         L += ["", "## Errors", ""] + [f"- **{k}:** {v}" for k, v in state["errors"].items()]
     return "\n".join(L) + "\n"
@@ -856,7 +895,7 @@ def write_outputs(tpl: Template, state: State, out: Path) -> None:
     (out / "document.md").write_text(render_document(tpl, state, annotated=False), encoding="utf-8")
     (out / "document_annotated.md").write_text(render_document(tpl, state, annotated=True), encoding="utf-8")
     (out / "reconciliation_report.md").write_text(render_report(tpl, state), encoding="utf-8")
-    keep = ("sections", "evidence", "errors", "findings", "review", "history", "refreshed")
+    keep = ("sections", "evidence", "errors", "findings", "review", "history", "refreshed", "docs_summary")
     (out / "run.json").write_text(json.dumps({k: state.get(k) for k in keep}, indent=2), encoding="utf-8")
     log(f"wrote {out}/document.md, document_annotated.md, reconciliation_report.md, run.json")
 
@@ -907,6 +946,21 @@ class FakeLLM:
                       summary="Dry-run review.")
 
 
+class FakeDocs:
+    """Dry-run stand-in for DocsLibrary: nothing is downloaded."""
+
+    def __init__(self, collections: list[Collection]):
+        self.collections = collections
+
+    async def collect(self, refresh: bool = False) -> list[dict]:
+        log("docs   dry run: nothing downloaded")
+        return [{"url": c.url, "recursive": c.recursive, "prefixes": c.prefixes, "pages": 0, "skipped": 0,
+                 "collected_at": "dry-run", "folder": "dry-run"} for c in self.collections]
+
+    def retrieve(self, keys: list[str], terms: list[str]) -> list[dict]:
+        return [_ev("docs", f"dry-run:{k} › passage", "Sample official documentation passage.") for k in keys[:1]]
+
+
 async def fake_loader(src: SourceSpec, http) -> list[dict]:
     locs = src.urls or src.paths or ([src.query] if src.query else [])
     return [_ev(src.type, f"dry-run:{loc}", f"Sample {src.type} evidence.") for loc in locs]
@@ -923,6 +977,9 @@ async def amain() -> None:
     ap.add_argument("-o", "--out", help="output folder (default: <output_dir>/<request file name>)")
     ap.add_argument("--dry-run", action="store_true", help="no LLM or network calls")
     ap.add_argument("--graph", action="store_true", help="print the graph as Mermaid and exit")
+    ap.add_argument("--collect-only", action="store_true",
+                    help="only collect the official documentation (for review), then exit")
+    ap.add_argument("--refresh-docs", action="store_true", help="download the documentation again, ignoring the cache")
     args = ap.parse_args()
 
     tpl, variables, context_text, cfg = load_inputs(args.template, args.request, args.config)
@@ -932,8 +989,23 @@ async def amain() -> None:
     log(f"document: {tpl.document_title}")
     log("outline:  " + " | ".join(tpl.heading(s) for s in tpl.sections))
     log("run order: " + " -> ".join("[" + ", ".join(w) + "]" for w in waves))
+    by_section = docs_collections(tpl, cfg.docs)
+    docs_keys = {sid: [c.key for c in cs] for sid, cs in by_section.items()}
+    all_collections = list({c.key: c for cs in by_section.values() for c in cs}.values())
+    docs = None
+    if all_collections:
+        docs = FakeDocs(all_collections) if (args.dry_run or args.graph) else DocsLibrary(cfg.docs, all_collections)
 
-    async with httpx.AsyncClient(timeout=60, headers={"User-Agent": "docgen/0.4"}) as http:
+    if args.collect_only:
+        if not docs:
+            raise SystemExit("the template has no docs sources")
+        for d in await docs.collect(refresh=args.refresh_docs):
+            print(f"{d['url']}\n  recursive: {d['recursive']}  pages: {d['pages']}  skipped: {d['skipped']}"
+                  f"  collected: {d['collected_at']}\n  review: {d['folder']}/pages  (details: manifest.json)")
+        print("\nDelete any page file you do not want used, then run without --collect-only.")
+        return
+
+    async with httpx.AsyncClient(timeout=60, headers={"User-Agent": "docgen/0.6"}) as http:
         if args.dry_run or args.graph:
             writer = reviewer = FakeLLM(tpl.sections[-1].id)
             loaders = {k: fake_loader for k in LOADERS}
@@ -945,7 +1017,8 @@ async def amain() -> None:
             await asyncio.gather(writer.preflight(), reviewer.preflight())
             if any(src.type == "m365" for s in tpl.sections for src in s.sources):
                 GRAPH_TOKEN["token"] = await asyncio.to_thread(acquire_graph_token)  # one SSO prompt per run
-        graph = build_graph(tpl, context, writer, reviewer, http, loaders, cfg.max_evidence_chars, out_dir)
+        graph = build_graph(tpl, context, writer, reviewer, http, loaders, cfg.max_evidence_chars, out_dir,
+                            docs, docs_keys, args.refresh_docs)
         if args.graph:
             print(graph.get_graph().draw_mermaid())
             return

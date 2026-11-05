@@ -15,3 +15,10 @@ llm:
     model: "openai/gpt-4o"                    # ideally a stronger model from a different family
     api_key_env: OPENROUTER_API_KEY
     temperature: 0.0
+
+docs:                              # official documentation collector (README: "Official documentation")
+  cache_dir: docs_cache            # snapshot: one folder per URL, Markdown pages + manifest.json
+  user_agent: "docgen-docs-collector/1.0 (internal architecture documentation)"
+  delay_s: 1.0                     # minimum pause between requests to a site (robots.txt may ask for more)
+  max_pages: 25                    # page limit per URL when recursive: true
+  passages_per_agent: 8            # relevant passages given to each agent

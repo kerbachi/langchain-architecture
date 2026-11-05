@@ -12,6 +12,8 @@ requirements and scope agreed with the requesters.
 | `s3_files_aegon_spain.md` | **Requirements and scope** for the document, as expressed and shared with the requesters | You, one file per request |
 | `config.yaml` | **LLM settings**: which models write and review | You, once per environment |
 | `docgen.py` | The engine. Contains no request-specific text | Nobody, normally |
+| `docs_library.py` | Official documentation collector and local passage search | Nobody, normally |
+| `docs_cache/` | Snapshot of the collected official documentation (Markdown pages) | Generated; you may delete pages |
 | `out/<requirements file name>/document.md` | **The final document** | Generated |
 
 ## Quick start
@@ -22,8 +24,9 @@ requirements and scope agreed with the requesters.
     python docgen.py -t component_standard.yaml -r s3_files_aegon_spain.md --dry-run   # test, no LLM needed
     python docgen.py -t component_standard.yaml -r s3_files_aegon_spain.md             # real run
 
-`-t` is the template, `-r` the requirements and scope file, `-c` the LLM settings (default `config.yaml`).
-Add `--graph` to print the processing graph instead of running it.
+`-t` is the template, `-r` the requirements and scope file, `-c` the settings (default `config.yaml`).
+Add `--graph` to print the processing graph, `--collect-only` to only collect the official
+documentation for review, `--refresh-docs` to download it again.
 
 ## 1. Template: titles and prompts (`component_standard.yaml`)
 
@@ -43,8 +46,10 @@ sections:
     guidelines: |                                # optional, extra instructions for this section only
       - Keep it under 400 words.
     sources:                                     # optional, extra material this agent reads
-      - type: url
+      - type: docs                               # official documentation (see below)
         urls: "{{reference_urls}}"
+        recursive: true
+    retrieval_keywords: "overview features"      # optional, helps pick relevant documentation passages
     depends_on: []                               # optional, sections that must be written first
 ```
 
@@ -56,7 +61,8 @@ sections:
 | `title` | Section heading, printed exactly as written |
 | `directives` | What the agent must write; one item per line, each item is checked in the final review |
 | `guidelines` | Extra instructions for this section only |
-| `sources` | Extra material for this agent: `url`, `file`, `web`, `m365` (see below) |
+| `sources` | Extra material for this agent: `docs`, `file`, `url`, `web`, `m365` (see Source types) |
+| `retrieval_keywords` | Extra words used to pick this agent's passages from the official documentation |
 | `depends_on` | Changes **when** a section is written, never **where** it appears |
 | `table_columns` | Makes the section a table with exactly these columns, e.g. `["Title", "Description"]`. The agent supplies the rows; the script draws the table |
 | `key_facts` | Facts every agent must state the same way; differences are flagged in the review |
@@ -78,7 +84,7 @@ requesters. `docgen.py` reads it once at the start and splits it in two:
 ```markdown
 ---
 component: "Amazon S3 Files"         # fills {{component}} in the template
-reference_urls:                      # fills {{reference_urls}}: pages the agents may read
+reference_urls:                      # fills {{reference_urls}}: official documentation start URLs
   - https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-files.md
 attachments: []                      # fills {{attachments}}: local files (PDF, DOCX, MD ...)
 policy_documents: []                 # fills {{policy_documents}}: corporate policy and governance files
@@ -128,6 +134,7 @@ from the template (`build_graph` in `docgen.py`).
 
 With the current template, a run goes like this:
 
+0. **The official documentation is collected** (or the snapshot reused), once, before any agent starts.
 1. **Purpose**, **Overview: Drivers and Motivation** and **Business Value** start at the same time
    (no `depends_on`).
 2. **Use Cases** starts as soon as the Overview is finished, and **Component Summary** as soon as
@@ -141,6 +148,49 @@ Agents running at the same time never see each other's text. Each one receives t
 section titles, so it knows what the others cover. Only sections listed in `depends_on` pass their
 text forward. `max_concurrency` in `config.yaml` limits how many agents call the same model at once;
 extra agents wait for a free slot.
+
+## Official documentation (URL fetch, recursion, robots.txt)
+
+Each agent's `docs` source lists its URLs and whether to follow links:
+
+```yaml
+sources:
+  - type: docs
+    urls: "{{reference_urls}}"    # or the URLs written directly, e.g. ["https://docs.aws.amazon.com/..."]
+    recursive: true               # false = only these pages; true = also linked pages under the same address
+```
+
+**What is fetched.** Only the listed URLs. With `recursive: true`, links on those pages are followed
+only when they start with the same address as the start page, without `.html`. For example,
+`.../userguide/s3-files.html` also collects `.../userguide/s3-files-quotas.html`, but nothing else in the
+guide. Set `under: [<prefix>]` to choose another starting address, and `max_pages` to change the limit.
+
+**How it is enforced.** All downloads go through one `httpx` client that checks every request before it is
+sent, including redirects. Any URL outside the approved addresses is refused and listed as skipped.
+Corporate proxy settings (`HTTPS_PROXY`) apply.
+
+**robots.txt.** Before collecting from a site, its `robots.txt` (the site's rules for automated tools) is
+read through the same client, with Protego. Disallowed pages are skipped. A site whose `robots.txt` cannot
+be read is skipped entirely. Requests are spaced by `delay_s`, or longer if `robots.txt` asks.
+
+**Snapshot.** Pages are saved as Markdown in `docs_cache/<url>/pages/`, with a `manifest.json` listing
+each page, its date and fingerprint, and every skipped URL with the reason. Later runs reuse the snapshot
+without downloading; `--refresh-docs` downloads again. Run `--collect-only` to review the pages first;
+delete any page file you don't want used.
+
+**What each agent receives.** Not whole pages: the passages that best match its title, directives and
+`retrieval_keywords`, found by a local full-text search (SQLite, built into Python). Nothing is sent
+outside for this. Each passage keeps its URL and heading, so citations point to the exact page.
+
+Settings in `config.yaml`, under `docs:`:
+
+| Key | Meaning |
+|---|---|
+| `cache_dir` | Where the snapshot is stored (default `docs_cache`) |
+| `user_agent` | How the collector identifies itself to the sites |
+| `delay_s` | Minimum pause between requests to a site |
+| `max_pages` | Page limit per URL when `recursive: true` |
+| `passages_per_agent` | Number of passages given to each agent |
 
 ## Final review
 
@@ -171,7 +221,8 @@ extra agents wait for a free slot.
 
 | `type` | Reads | Needs |
 |---|---|---|
-| `url` | Web pages listed in `urls` | Nothing |
+| `docs` | Official documentation from `urls`, optionally `recursive`; each agent gets the relevant passages | Nothing (see Official documentation) |
+| `url` | Whole web pages listed in `urls`, no link following | Nothing |
 | `file` | Local files listed in `paths` | `pip install docling` for PDF, DOCX, PPTX |
 | `web` | Web search results for `query` | A SearXNG server in `SEARXNG_URL` |
 | `m365` | SharePoint/OneDrive through the Microsoft 365 Copilot Retrieval API | Copilot licence; `M365_CLIENT_ID` and `M365_TENANT_ID` (Entra app, delegated Files.Read.All and Sites.Read.All), or a token in `GRAPH_TOKEN` |
@@ -184,10 +235,12 @@ extra agents wait for a free slot.
 | Different titles, order or instructions | Edit `sections` in a copy of the template |
 | Write a section after others | Add `depends_on` to it (its position does not change) |
 | Give a section more material | Add `sources` to it |
+| Collect more or fewer documentation pages | Change `recursive`, `under` or `max_pages` on its `docs` source |
 | Use other models | Edit `config.yaml` |
 
 ## Test
 
     pip install pytest && pytest -q
 
-Runs the pipeline offline with a sample requirements file and checks that the document follows the template.
+Runs offline: the pipeline with a sample requirements file (the document must follow the template), and the
+documentation collector against a simulated site (it must never fetch an unapproved URL).
