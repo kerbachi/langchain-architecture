@@ -1,73 +1,154 @@
-# docgen - outline-driven multi-agent document generator (LangGraph)
+# docgen
 
-    docgen.py                  engine (generic, no request-specific text)
-    component_standard.yaml    reusable template: title, outline (exact headings in order), directives, sources
-    <request>.md               one request: front-matter variables + global context
-    config.yaml                environment: LLM endpoints, output folder
-    tests/test_dry_run.py      smoke test (no LLM needed)
+Generates a design document from a template. Several LLM agents write the sections (in parallel
+where possible), then a final review checks the sections against each other and against the
+requirements and scope agreed with the requesters.
 
-## Commands
+## Files
+
+| File | What it contains | Who edits it |
+|---|---|---|
+| `component_standard.yaml` | **Template**: the document title, the section titles in order, and the instructions (prompts) for each section | You, once per document type |
+| `s3_files_aegon_spain.md` | **Requirements and scope** for the document, as expressed and shared with the requesters | You, one file per request |
+| `config.yaml` | **LLM settings**: which models write and review | You, once per environment |
+| `docgen.py` | The engine. Contains no request-specific text | Nobody, normally |
+| `out/<requirements file name>/document.md` | **The final document** | Generated |
+
+## Quick start
 
     python -m venv .venv && source .venv/bin/activate
     pip install -r requirements.txt
-    python docgen.py -t component_standard.yaml -r my_request.md --graph     # show the LangGraph
-    python docgen.py -t component_standard.yaml -r my_request.md --dry-run   # offline test
-    python docgen.py -t component_standard.yaml -r my_request.md             # real run
-    pip install pytest && pytest -q                                          # smoke test
 
-Results in `out/<request name>/`:
+    python docgen.py -t component_standard.yaml -r s3_files_aegon_spain.md --dry-run   # test, no LLM needed
+    python docgen.py -t component_standard.yaml -r s3_files_aegon_spain.md             # real run
 
-- `document.md`: the deliverable. Template headings only, in template order, no citation markers.
-- `document_annotated.md`: same content with [R1]/[E1] citations and the sources of each section.
-- `reconciliation_report.md`: conflicts, gaps, overlaps, automated findings, revision history.
-- `run.json`: full state, including a content hash of every source, for audit.
+`-t` is the template, `-r` the requirements and scope file, `-c` the LLM settings (default `config.yaml`).
+Add `--graph` to print the processing graph instead of running it.
 
-## The outline
+## 1. Template: titles and prompts (`component_standard.yaml`)
 
-The `sections` list in the template is the document outline. Its order is the document order,
-each `title` is printed exactly as written (numbered when `numbering: true`), and agents write
-only the body under it; any heading a model writes is turned into bold text.
-`depends_on` changes when an agent runs, never where its section appears. When the final review
-revises a section, every section that depends on it is re-run before the next review.
+Each entry under `sections` is one section of the final document and one agent.
+The order of the list is the order of the document.
 
-## Request file
+```yaml
+document_title: "Component standard request: {{component}}"
+numbering: true
 
-    ---
-    component: "Amazon S3 Files"            # used as {{component}} in the template
-    reference_urls: [https://...]           # used as {{reference_urls}}
-    attachments: []                         # used as {{attachments}}
-    ---
-    Paste the request text here. Every agent receives it as [R1].
+sections:
+  - id: drivers_motivation                       # internal name, never printed
+    title: "Overview: Drivers and Motivation"    # printed exactly as written
+    directives: |                                # the prompt for this section's agent
+      Describe what the component is.
+      Describe the motivation for using the component.
+    guidelines: |                                # optional, extra instructions for this section only
+      - Keep it under 400 words.
+    sources:                                     # optional, extra material this agent reads
+      - type: url
+        urls: "{{reference_urls}}"
+    depends_on: []                               # optional, sections that must be written first
+```
 
-## Reusing it
+| Field | Effect |
+|---|---|
+| `document_title` | Main title of the document |
+| `numbering` | `true` prints "1. Title", "2. Title" ...; `false` prints titles exactly as written |
+| `writer_guidelines` | Instructions applied to every section (audience, tone, length) |
+| `title` | Section heading, printed exactly as written |
+| `directives` | What the agent must write; one item per line, each item is checked in the final review |
+| `guidelines` | Extra instructions for this section only |
+| `sources` | Extra material for this agent: `url`, `file`, `web`, `m365` (see below) |
+| `depends_on` | Changes **when** a section is written, never **where** it appears |
+| `key_facts` | Facts every agent must state the same way; differences are flagged in the review |
+| `max_revision_rounds` | How many times the final review may send sections back for correction |
 
-| You want to...                               | Change                                                        |
-|----------------------------------------------|---------------------------------------------------------------|
-| Same outline, different component/request    | New request `.md` file                                        |
-| Different headings, order or directives      | Copy the template, edit `sections` (order = document order)   |
-| Run an agent after others                    | Add `depends_on: [ids]` to it (its position does not change)  |
-| Ground an agent in more sources              | Add `sources` (file, url, web, m365) to that section          |
-| Different models / providers                 | `config.yaml` (any OpenAI-compatible `/v1` endpoint)          |
+`{{component}}` and other `{{...}}` values are filled from the top block of the requirements and scope file.
 
-## LLM settings (per role in config.yaml)
+## 2. Requirements and scope (`s3_files_aegon_spain.md`)
 
-| Key           | Meaning                                                                          |
-|---------------|----------------------------------------------------------------------------------|
-| base_url      | Ollama `:11434/v1`, vLLM `:8000/v1`, LM Studio `:1234/v1`, OpenRouter, OpenAI     |
-| model         | Must match an id from `GET <base_url>/models`; the run warns at start if not      |
-| json_mode     | `false` text + tolerant parsing, `true` json_object, `schema` enforced JSON schema |
-| max_tokens    | Output cap; set it high enough for a full section in JSON                        |
-| extra_body    | Server-specific options, e.g. vLLM `{chat_template_kwargs: {enable_thinking: false}}` |
-| timeout_s     | Per request; raise for large local models                                        |
+This file holds the requirements and scope for the document, as expressed and shared with the
+requesters. Every agent reads it, and the final review checks the whole document against it.
+
+```markdown
+---
+component: "Amazon S3 Files"         # fills {{component}} in the template
+reference_urls:                      # fills {{reference_urls}}: pages the agents may read
+  - https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-files.md
+attachments: []                      # fills {{attachments}}: local files (PDF, DOCX, MD ...)
+---
+Paste the requesters' text here, as it was shared.
+```
+
+This file usually contains internal information (names, business units, plans).
+Do not commit real ones to a public repository.
+
+## 3. Output (`out/<requirements file name>/`)
+
+| File | Use |
+|---|---|
+| `document.md` | **The deliverable.** Template titles, in template order, with the agents' text |
+| `document_annotated.md` | Same text with source references under each section, to check where statements come from |
+| `reconciliation_report.md` | Result of the final review: conflicts, gaps, open questions, revisions made |
+| `run.json` | Technical record of the run, for audit |
+
+## How each section is written
+
+For each section, `docgen.py` builds the prompt automatically from:
+
+1. Fixed role instructions (`WRITER_SYSTEM` in `docgen.py`)
+2. The document title and the list of all section titles
+3. The requirements and scope file
+4. The section's `title`, `directives` and guidelines
+5. The content of the section's `sources`
+6. Already written sections listed in `depends_on`
+
+The agent returns only the body text. The script adds the heading, so titles never change.
+
+## Final review
+
+1. Automatic checks: facts stated differently by two sections, directives not covered,
+   statements without a source, numbers that appear in no source.
+2. A reviewer LLM (instructions in `REVIEWER_SYSTEM` in `docgen.py`) compares all sections with
+   each other and with the requirements and scope.
+3. Sections with problems are rewritten, sections that depend on them are refreshed, and the
+   review runs again, up to `max_revision_rounds`. Anything still unresolved is listed in
+   `reconciliation_report.md` for a human decision.
+
+## LLM settings (`config.yaml`)
+
+`writer` is used for the sections, `reviewer` for the final review. Any OpenAI-compatible server works.
+
+| Key | Meaning |
+|---|---|
+| `base_url` | Ollama `http://localhost:11434/v1`, vLLM `:8000/v1`, LM Studio `:1234/v1`, `https://openrouter.ai/api/v1`, `https://api.openai.com/v1` |
+| `model` | Must match an id returned by `<base_url>/models`; the run warns at start if not |
+| `api_key_env` | Name of the environment variable holding the API key (never the key itself) |
+| `json_mode` | `false` plain text, `true` JSON mode, `schema` enforced JSON schema (LM Studio, vLLM, OpenAI) |
+| `max_tokens` | Maximum output length; set high enough for a full section |
+| `timeout_s` | Seconds per request; raise it for large local models |
+| `max_concurrency` | How many agents may call this model at the same time |
+| `extra_body` | Server-specific options, e.g. vLLM `{chat_template_kwargs: {enable_thinking: false}}` |
 
 ## Source types
 
-`file` (PDF/DOCX/PPTX need `pip install docling`), `url`, `web` (needs `SEARXNG_URL`),
-`m365` (M365 Copilot Retrieval API; needs `M365_CLIENT_ID` and `M365_TENANT_ID` for an Entra app
-with public client flow and delegated Files.Read.All + Sites.Read.All, or a token in `GRAPH_TOKEN`).
+| `type` | Reads | Needs |
+|---|---|---|
+| `url` | Web pages listed in `urls` | Nothing |
+| `file` | Local files listed in `paths` | `pip install docling` for PDF, DOCX, PPTX |
+| `web` | Web search results for `query` | A SearXNG server in `SEARXNG_URL` |
+| `m365` | SharePoint/OneDrive through the Microsoft 365 Copilot Retrieval API | Copilot licence; `M365_CLIENT_ID` and `M365_TENANT_ID` (Entra app, delegated Files.Read.All and Sites.Read.All), or a token in `GRAPH_TOKEN` |
 
-## Final reconciliation
+## Reusing it
 
-Automated checks (key-fact mismatches, directives not covered, claims without valid citations,
-figures not found in any source), then the reviewer LLM (conflicts, gaps vs. the request, overlaps),
-then targeted revision of flagged sections and refresh of their dependents, up to `max_revision_rounds`.
+| You want to... | Change |
+|---|---|
+| Same document type, new request | Create a new requirements and scope file |
+| Different titles, order or instructions | Edit `sections` in a copy of the template |
+| Write a section after others | Add `depends_on` to it (its position does not change) |
+| Give a section more material | Add `sources` to it |
+| Use other models | Edit `config.yaml` |
+
+## Test
+
+    pip install pytest && pytest -q
+
+Runs the pipeline offline with a sample requirements file and checks that the document follows the template.
