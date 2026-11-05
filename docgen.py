@@ -66,6 +66,7 @@ class SectionSpec(BaseModel):
     use_request_context: bool = True       # give the global context [R1] to this agent
     depends_on: list[str] = []             # empty = starts immediately, in parallel with the others
     guidelines: str = ""                   # section-specific writing guidance
+    table_columns: list[str] = []          # set = the section is a table with exactly these columns
 
     @property
     def directive_list(self) -> list[tuple[str, str]]:
@@ -212,6 +213,16 @@ class SectionDraft(BaseModel):
     assumptions: list[str] = []
     open_questions: list[str] = []
     directives_covered: list[str] = []
+    rows: list[list[str]] = []             # table sections only: one list of cell values per row
+
+    @field_validator("rows", mode="before")
+    @classmethod
+    def _rows(cls, v):
+        out = []
+        for r in v or []:
+            r = list(r.values()) if isinstance(r, dict) else [r] if isinstance(r, str) else r
+            out.append([str(c) for c in r])
+        return out
 
     @field_validator("key_facts", mode="before")
     @classmethod
@@ -466,7 +477,9 @@ Return ONLY a JSON object with this shape:
  "key_facts": {"<key fact name>": "<short canonical value>"},
  "assumptions": ["..."],
  "open_questions": ["..."],
- "directives_covered": ["<directive id>"]}"""
+ "directives_covered": ["<directive id>"],
+ "rows": [["cell 1", "cell 2"]]}
+"rows" is used only when the section is a table (see FORMAT); otherwise return an empty list."""
 
 REVIEWER_SYSTEM = """You are the final reviewer of an architecture document whose sections were written by separate
 agents, following a fixed OUTLINE. Check every section against the REQUEST CONTEXT and the document PURPOSE:
@@ -493,8 +506,8 @@ def writer_prompt(tpl: Template, spec: SectionSpec, evidence: list[dict], upstre
                   revision: str | None = None, previous: str | None = None) -> str:
     ctx = next((e for e in evidence if e["id"] == "R1"), None)
     ev = "\n\n".join(f"[{e['id']}] ({e['source']}: {e['locator']})\n{e['text']}" for e in evidence if e["id"] != "R1")
-    up = "\n\n".join(f"--- {tpl.heading(tpl.section(sid))} ---\n{d['body'][:6000]}\nKey facts: "
-                     f"{json.dumps(d['key_facts'])}" for sid, d in upstream.items())
+    up = "\n\n".join(f"--- {tpl.heading(tpl.section(sid))} ---\n{section_markdown(tpl.section(sid), d)[:6000]}\n"
+                     f"Key facts: {json.dumps(d['key_facts'])}" for sid, d in upstream.items())
     directives = "\n".join(f"{did}: {text}" for did, text in spec.directive_list)
     parts = [f"DOCUMENT: {tpl.document_title}", f"PURPOSE: {tpl.purpose}",
              "OUTLINE (each section is written by a different agent):\n" + tpl.outline()]
@@ -502,6 +515,10 @@ def writer_prompt(tpl: Template, spec: SectionSpec, evidence: list[dict], upstre
         parts.append(f'<request_context id="R1">\n{ctx["text"]}\n</request_context>')
     parts += [f"YOUR SECTION: {tpl.heading(spec)} (id: {spec.id})",
               "DIRECTIVES (cover all of them, in this order):\n" + directives,
+              *([f"FORMAT: this section is a table. TABLE COLUMNS: {' | '.join(spec.table_columns)}\n"
+                 f'Return one row per item in "rows", each row a list of {len(spec.table_columns)} cell values '
+                 'in that column order. The script draws the table, so do not write a table in "body"; '
+                 '"body" may be empty or one short introductory sentence.'] if spec.table_columns else []),
               "WRITING GUIDELINES:\n" + "\n".join(x for x in (tpl.writer_guidelines, spec.guidelines) if x.strip()),
               f"KEY FACTS to report (only those this section takes a position on): {', '.join(tpl.key_facts) or '(none)'}",
               "UPSTREAM SECTIONS (context only):\n" + (up or "(none)"),
@@ -530,8 +547,8 @@ Key facts: {json.dumps(d['key_facts'])}
 Claims:
 {claims or '(none)'}
 Open questions: {d['open_questions']}
-Body:
-{d['body'][:6000]}
+Content:
+{section_markdown(s, d)[:6000]}
 </section>""")
     return "\n\n".join(parts)
 
@@ -592,7 +609,9 @@ def deterministic_checks(tpl: Template, sections: dict, evidence: dict) -> list[
             findings.append({"type": "unsupported_claims", "section": s.id, "count": len(bad), "examples": bad[:5]})
         # (d) figures (%, money, durations, sizes) that appear in no source
         compact_src = re.sub(r"\s+", "", src_text.get(s.id, "")).lower()
-        figs = sorted({f.strip() for f in FIGURE.findall(d["body"])
+        if s.table_columns and not d.get("rows"):
+            findings.append({"type": "empty_table", "section": s.id, "columns": s.table_columns})
+        figs = sorted({f.strip() for f in FIGURE.findall(section_markdown(s, d))
                        if re.sub(r"\s+", "", f).lower() not in compact_src})
         if figs:
             findings.append({"type": "ungrounded_figures", "section": s.id, "figures": figs[:10]})
@@ -609,6 +628,13 @@ def clean_draft(draft: SectionDraft, tpl: Template, spec: SectionSpec) -> dict:
         d["key_facts"] = {k: v for k, v in d["key_facts"].items() if k in tpl.key_facts}
     valid = {did for did, _ in spec.directive_list}
     d["directives_covered"] = [x for x in d["directives_covered"] if x in valid]
+    n, rows = len(spec.table_columns), []
+    for r in d["rows"] if n else []:
+        r = [c.strip() for c in r]
+        r = r[:n - 1] + [" ".join(r[n - 1:])] if len(r) > n else r + [""] * (n - len(r))
+        if any(r):
+            rows.append(r)
+    d["rows"] = rows
     return d
 
 
@@ -619,7 +645,7 @@ def err_text(e: Exception) -> str:
 def failed_draft(spec: SectionSpec, e: Exception) -> dict:
     return {"body": f"> **Section generation failed:** `{err_text(e)}`", "claims": [], "key_facts": {},
             "assumptions": [], "open_questions": [f"'{spec.title}' could not be generated: {err_text(e)}"],
-            "directives_covered": []}
+            "directives_covered": [], "rows": []}
 
 
 # =============================================================================
@@ -687,7 +713,8 @@ def build_graph(tpl: Template, context: dict, writer, reviewer, http, loaders, m
         log(f"revise {tpl.heading(spec)}")
         upstream = {d: payload["sections"][d] for d in spec.depends_on}
         prompt = writer_prompt(tpl, spec, payload["evidence"].get(spec.id, []), upstream,
-                               revision=payload["instructions"], previous=payload["sections"][spec.id]["body"])
+                               revision=payload["instructions"],
+                               previous=section_markdown(spec, payload["sections"][spec.id]))
         try:  # same cached evidence: same sources of truth, reproducible
             draft = await writer.json(WRITER_SYSTEM, prompt, SectionDraft)
             return {"sections": {spec.id: clean_draft(draft, tpl, spec)}}
@@ -720,7 +747,7 @@ def build_graph(tpl: Template, context: dict, writer, reviewer, http, loaders, m
             prompt = writer_prompt(tpl, spec, state["evidence"].get(spec.id, []),
                                    {d: sections[d] for d in spec.depends_on},
                                    revision="Upstream sections were revised. Update this section so it stays "
-                                            "consistent with them.", previous=sections[spec.id]["body"])
+                                            "consistent with them.", previous=section_markdown(spec, sections[spec.id]))
             try:
                 return clean_draft(await writer.json(WRITER_SYSTEM, prompt, SectionDraft), tpl, spec)
             except Exception as e:
@@ -770,11 +797,26 @@ def _cell(s: Any) -> str:
     return str(s).replace("|", "\\|").replace("\n", " ")
 
 
+def render_table(columns: list[str], rows: list[list[str]], strip_citations: bool) -> str:
+    def cell(x: str) -> str:
+        return (CITATION.sub("", x) if strip_citations else x).replace("|", "\\|").replace("\n", " ").strip()
+    lines = ["| " + " | ".join(columns) + " |", "|" + "|".join("---" for _ in columns) + "|"]
+    return "\n".join(lines + ["| " + " | ".join(cell(c) for c in r) + " |" for r in rows])
+
+
+def section_markdown(spec: SectionSpec, d: dict, annotated: bool = True) -> str:
+    """The text printed under a section heading: the body, then the table for table sections."""
+    body = (d["body"] if annotated else CITATION.sub("", d["body"])).strip()
+    parts = [body] if body else []
+    if spec.table_columns:
+        parts.append(render_table(spec.table_columns, d.get("rows", []), strip_citations=not annotated))
+    return "\n\n".join(parts)
+
+
 def render_document(tpl: Template, state: State, annotated: bool) -> str:
     lines = [f"# {tpl.document_title}", ""]
     for s in tpl.sections:                                   # template order, never execution order
-        body = state["sections"][s.id]["body"]
-        lines += [f"## {tpl.heading(s)}", "", body if annotated else CITATION.sub("", body), ""]
+        lines += [f"## {tpl.heading(s)}", "", section_markdown(s, state["sections"][s.id], annotated), ""]
         if annotated:
             lines += ["*Sources:*", ""] + [f"- [{e['id']}] {e['source']}: {e['locator']} (sha256 {e['sha256']})"
                                           for e in state["evidence"].get(s.id, [])] + [""]
@@ -840,7 +882,12 @@ class FakeLLM:
                 body = "### A heading the model should not write\n\n" + body + "\n\nIt cuts operating cost by 40%."
             facts = {"component_name": "Amazon S3 Files",
                      "target_platform": "Amazon Linux 2" if wrong else "Amazon Linux 2023"}
-            return SectionDraft(body=body, key_facts=facts, directives_covered=dids,
+            cols = re.search(r"TABLE COLUMNS: (.*)", user)
+            rows = [[f"Sample {c.strip().lower()} {i} [R1]" for c in cols.group(1).split("|")] for i in (1, 2, 3)] \
+                if cols else []
+            if cols:
+                body = "Accepted use cases [R1]."
+            return SectionDraft(body=body, key_facts=facts, directives_covered=dids, rows=rows,
                                 claims=[Claim(statement=f"{sid} claim", evidence=["R1"])])
         findings = json.loads(re.search(r"<findings>\n(.*?)\n</findings>", user, flags=re.S).group(1))
         revs: dict[str, str] = {}

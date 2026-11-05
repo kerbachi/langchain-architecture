@@ -22,4 +22,6 @@ def test_dry_run_follows_outline(tmp_path):
     headings = [line[3:] for line in doc.splitlines() if line.startswith("## ")]
     assert headings == [f"{i}. {s['title']}" for i, s in enumerate(tpl["sections"], 1)]
     assert "[R1]" not in doc and "###" not in doc
+    use_cases = doc.split("## ")[[h.split(". ", 1)[-1] for h in headings].index("Use Cases") + 1]
+    assert "| Title | Description |" in use_cases and use_cases.count("\n| ") >= 3  # header + rows
     assert "**Status:** PASS" in (out / "reconciliation_report.md").read_text(encoding="utf-8")

@@ -15,6 +15,7 @@ required_vars: [component]          # the request file MUST define these
 defaults:                           # used when the request file does not define them
   reference_urls: []
   attachments: []
+  policy_documents: []              # corporate policy / governance files used by the Use Cases section
 
 writer_guidelines: |
   - Audience: enterprise architecture review board. Factual and concise, no marketing language.
@@ -38,6 +39,7 @@ max_revision_rounds: 1
 #   directives  what the agent must cover; one item per line, each one checked in the final review
 #   sources     extra sources of truth; the request text [R1] is always included
 #   depends_on  changes WHEN an agent runs, never WHERE its section appears
+#   table_columns  makes the section a table with exactly these columns (drawn by the script)
 # =============================================================================
 sections:
 
@@ -73,6 +75,26 @@ sections:
       # - type: m365
       #   query: "Which file storage and S3 access components are approved standards?"
       #   filter_expression: 'path:"https://yourtenant.sharepoint.com/sites/ArchitectureStandards/"'
+
+  - id: use_cases
+    title: "Use Cases"
+    directives: |
+      List the use cases for which the component is accepted, based on the requirements and scope and the Overview section.
+      Keep only use cases that are aligned with the corporate policy and governance found in the sources.
+      If no policy or governance source is available, add an open question that policy alignment must be confirmed.
+    table_columns: ["Title", "Description"]
+    depends_on: [drivers_motivation]        # receives the finished "Overview: Drivers and Motivation" section
+    sources:
+      - type: file
+        paths: "{{policy_documents}}"       # corporate policy and governance documents, if provided
+      # Policy and governance pages from SharePoint (needs M365 Copilot licence):
+      # - type: m365
+      #   query: "What are the corporate policies and governance rules for cloud storage and data access?"
+      #   filter_expression: 'path:"https://yourtenant.sharepoint.com/sites/Governance/"'
+    guidelines: |
+      - Short phrases only. Title: 2 to 6 words. Description: one sentence, at most 20 words.
+      - 3 to 8 rows, most important first. Accepted use cases only, no rejected or future ones.
+      - No implementation details; those belong to other sections.
 
   - id: business_value
     title: "Business Value"

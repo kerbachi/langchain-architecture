@@ -58,6 +58,7 @@ sections:
 | `guidelines` | Extra instructions for this section only |
 | `sources` | Extra material for this agent: `url`, `file`, `web`, `m365` (see below) |
 | `depends_on` | Changes **when** a section is written, never **where** it appears |
+| `table_columns` | Makes the section a table with exactly these columns, e.g. `["Title", "Description"]`. The agent supplies the rows; the script draws the table |
 | `key_facts` | Facts every agent must state the same way; differences are flagged in the review |
 | `max_revision_rounds` | How many times the final review may send sections back for correction |
 
@@ -66,7 +67,13 @@ sections:
 ## 2. Requirements and scope (`s3_files_aegon_spain.md`)
 
 This file holds the requirements and scope for the document, as expressed and shared with the
-requesters. Every agent reads it, and the final review checks the whole document against it.
+requesters. `docgen.py` reads it once at the start and splits it in two:
+
+- **The top block** (between the `---` lines) is never sent to an agent. It only fills the
+  `{{...}}` values in the template: the document title, the pages and files agents should read.
+- **The text below it** is sent, in full, to every section agent, and sent again when a section is
+  rewritten. The final reviewer receives its first 20,000 characters and checks the whole document
+  against it. To keep it from one section, add `use_request_context: false` to that section.
 
 ```markdown
 ---
@@ -74,6 +81,7 @@ component: "Amazon S3 Files"         # fills {{component}} in the template
 reference_urls:                      # fills {{reference_urls}}: pages the agents may read
   - https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-files.md
 attachments: []                      # fills {{attachments}}: local files (PDF, DOCX, MD ...)
+policy_documents: []                 # fills {{policy_documents}}: corporate policy and governance files
 ---
 Paste the requesters' text here, as it was shared.
 ```
@@ -102,6 +110,37 @@ For each section, `docgen.py` builds the prompt automatically from:
 6. Already written sections listed in `depends_on`
 
 The agent returns only the body text. The script adds the heading, so titles never change.
+For a section with `table_columns`, the agent returns the rows as data and the script draws the
+table, so the columns are always exactly the ones in the template.
+
+## Who does the orchestration and consolidation?
+
+There is no "manager" AI deciding who runs when. **LangGraph** runs a plan that `docgen.py` builds
+from the template (`build_graph` in `docgen.py`).
+
+| Job | Done by | AI involved? |
+|---|---|---|
+| Deciding which sections run, in what order, and which run at the same time | LangGraph, from the order of `sections` and each `depends_on` | No |
+| Collecting the results of agents that ran in parallel | LangGraph's shared state: each agent files its text under its own section `id` | No |
+| Checking that sections agree with each other and with the requirements and scope | The final review: automatic checks, then the `reviewer` model from `config.yaml` | Yes, the reviewer |
+| Deciding which sections must be corrected | The reviewer names them; the script sends them back, up to `max_revision_rounds` | Partly |
+| Building the final document | The script puts each section's text under its template title, in template order | No |
+
+With the current template, a run goes like this:
+
+1. **Purpose**, **Overview: Drivers and Motivation** and **Business Value** start at the same time
+   (no `depends_on`).
+2. **Use Cases** starts as soon as the Overview is finished, and **Component Summary** as soon as
+   Purpose, Overview and Business Value are finished. Both receive the finished text they depend on.
+3. **The final review** runs once, after every section is finished.
+4. If problems are found, only the flagged sections are rewritten, the sections that depend on them
+   are refreshed, and the review runs again.
+5. `document.md` is written.
+
+Agents running at the same time never see each other's text. Each one receives the list of all
+section titles, so it knows what the others cover. Only sections listed in `depends_on` pass their
+text forward. `max_concurrency` in `config.yaml` limits how many agents call the same model at once;
+extra agents wait for a free slot.
 
 ## Final review
 
